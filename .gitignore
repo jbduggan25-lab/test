@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# scraped artifacts - large / entity-specific, don't commit
+data/pdfs/*.pdf
+data/text/*.txt
+data/debug/*
+data/output/*.csv
+!data/pdfs/.gitkeep
+!data/text/.gitkeep
+!data/debug/.gitkeep
+!data/output/.gitkeep
