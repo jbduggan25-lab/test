@@ -7,13 +7,20 @@ initial director and the president, treasurer, and clerk).
 
 Usage:
     pip install pdfplumber
-    python scraper/parse_articles.py data/pdfs          # a folder of PDFs
-    python scraper/parse_articles.py data/pdfs/001217378.pdf   # or one file
+    python scraper/parse_articles.py data/pdfs                       # a folder of PDFs
+    python scraper/parse_articles.py data/pdfs entities.csv          # + entity names for the review list
+    python scraper/parse_articles.py data/pdfs/001217378.pdf         # or one file
 
 Outputs (in data/output/):
     parsed_officers.csv   one row per person listed in Article VII(b)
     parsed_entities.csv   one row per filing, with roll-up counts and flags
-    parse_log.csv         per-file status (ok / no_table / needs_ocr / error)
+    parse_log.csv         per-file status (ok / no_table / needs_ocr / error) -
+                           this is your manual-review list: filter for status
+                           in (needs_ocr, no_table) to get every entity whose
+                           Article VII needs a human to open the PDF and read
+                           it directly (pass entities.csv as the second
+                           argument so this list includes entity names, not
+                           just the ID-number filename)
 
 Interpretation of the form:
     Article VII(b) is a 4-column table: Title | Individual Name |
@@ -30,9 +37,18 @@ Flags are heuristics to prioritise review, not legal conclusions:
     res_eq_po          residential address == the person's post-office address
     res_unit           residential block mentions suite/floor/unit (weak signal)
 
-needs_ocr in parse_log.csv means the PDF had under 200 characters of text
-(likely a scanned image, not an e-filed form) - this script does not attempt
-OCR; those filings need manual review or a separate OCR pass.
+needs_ocr in parse_log.csv means everything past the state's generic typed
+cover page (page 1, present on every filing) had under 200 characters of
+text - i.e. the actual filed Articles of Organization is a scanned image,
+not an e-filed form with a text layer. This script does not attempt OCR;
+those filings need manual review (open the PDF, read Article VII yourself)
+or a separate OCR pass.
+
+no_table means real text was found past the cover page, but no table
+matching the expected Article VII(b) header ("Title" / "Name" columns) was
+detected - this can mean the filing genuinely left officers/directors
+blank, or that this filing's layout doesn't match what find_officer_rows()
+expects. Worth a quick manual look either way.
 """
 
 import csv
@@ -49,6 +65,12 @@ CITY_LINE = re.compile(r"^(?P<city>.+?),\s*(?P<state>[A-Z]{2})\s+(?P<zip>\d{5}(?
 POBOX = re.compile(r"\b(P\.?\s*O\.?\s*BOX|POST\s+OFFICE\s+BOX|PMB)\b", re.I)
 CARE_OF = re.compile(r"\bC/O\b|\bCARE\s+OF\b", re.I)
 UNIT = re.compile(r"\b(STE|SUITE|FL|FLOOR|UNIT|APT|#)\b", re.I)
+CERTIFICATE_MARKERS = ("hereby certify", "upon examination")
+
+
+def _is_certificate_page(text):
+    t = text.lower()
+    return all(marker in t for marker in CERTIFICATE_MARKERS)
 
 
 # ------------------------------------------------------------ normalisation --
@@ -155,9 +177,19 @@ def find_officer_rows(pdf):
 
 def parse_pdf(path):
     with pdfplumber.open(path) as pdf:
-        text = "\n".join((p.extract_text() or "") for p in pdf.pages)
-        if len(text.strip()) < 200:
+        # Every filing bookends the actual filed Articles of Organization with
+        # a generic typed certificate page from the state ("I hereby certify
+        # that, upon examination...") - and this shows up as BOTH the first
+        # and last page, not just the first. When the real content (page 2+)
+        # is a scanned image with no text layer, the two certificate copies
+        # alone can still clear a whole-document length check, so judge
+        # needs_ocr on the non-certificate pages only.
+        page_texts = [(p.extract_text() or "") for p in pdf.pages]
+        substantive_pages = [t for t in page_texts if not _is_certificate_page(t)]
+        substantive_text = "\n".join(substantive_pages) if substantive_pages else "\n".join(page_texts)
+        if len(substantive_text.strip()) < 200:
             return None, [], "needs_ocr"
+        text = "\n".join(page_texts)
         meta = parse_metadata(text)
         meta["file"] = str(path)
         people = []
@@ -214,9 +246,17 @@ def roll_up(meta, people):
     }
 
 
-def main(target):
+def main(target, entities_csv=None):
     target = Path(target)
     files = sorted(target.glob("*.pdf")) if target.is_dir() else [target]
+
+    names_by_id = {}
+    if entities_csv:
+        import csv as _csv
+        with open(entities_csv, newline="", encoding="utf-8-sig") as fh:
+            for row in _csv.DictReader(fh):
+                names_by_id[(row.get("ID Number") or "").strip()] = row.get("Entityname") or ""
+
     officers, entities, log = [], [], []
     for f in files:
         try:
@@ -224,7 +264,8 @@ def main(target):
         except Exception as e:
             meta, people, status = None, [], f"error: {e!r}"[:120]
         log.append({"file": str(f), "status": status,
-                    "state_id": meta["state_id"] if meta else "",
+                    "state_id": meta["state_id"] if meta else f.stem,
+                    "entity_name": (meta["entity_name"] if meta and meta.get("entity_name") else names_by_id.get(f.stem, "")),
                     "n_persons": len(people)})
         officers.extend(people)
         if meta and people:
@@ -244,7 +285,7 @@ def main(target):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
+    if len(sys.argv) not in (2, 3):
         print(__doc__)
         sys.exit(1)
-    main(sys.argv[1])
+    main(sys.argv[1], sys.argv[2] if len(sys.argv) == 3 else None)
