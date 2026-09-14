@@ -277,10 +277,18 @@ def main(target, entities_csv=None):
 
     names_by_id = {}
     if entities_csv:
-        import csv as _csv
         with open(entities_csv, newline="", encoding="utf-8-sig") as fh:
-            for row in _csv.DictReader(fh):
-                names_by_id[(row.get("ID Number") or "").strip()] = row.get("Entityname") or ""
+            raw_rows = list(csv.reader(fh))
+        # Skip leading all-blank rows (Excel exports sometimes have one
+        # before the real header, which csv.DictReader would otherwise read
+        # as the header itself, emptying every column name).
+        while raw_rows and not any(cell.strip() for cell in raw_rows[0]):
+            raw_rows.pop(0)
+        if raw_rows:
+            header, data_rows = raw_rows[0], raw_rows[1:]
+            for row in data_rows:
+                d = dict(zip(header, row))
+                names_by_id[(d.get("ID Number") or "").strip()] = d.get("Entityname") or ""
 
     officers, entities, log = [], [], []
     for f in files:

@@ -72,21 +72,35 @@ PAGE_TIMEOUT = 45_000         # ms
 
 # ----------------------------------------------------------------- helpers --
 
+def _read_csv_rows(path):
+    """csv.DictReader, but skips leading all-blank rows first (Excel exports
+    sometimes have a blank row before the real header, which would otherwise
+    get read as the header itself, silently emptying every column name)."""
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        raw_rows = list(csv.reader(f))
+    while raw_rows and not any(cell.strip() for cell in raw_rows[0]):
+        raw_rows.pop(0)
+    if not raw_rows:
+        return
+    header, data_rows = raw_rows[0], raw_rows[1:]
+    for row in data_rows:
+        yield dict(zip(header, row))
+
+
 def load_input(path):
     """Read the Secretary's office export CSV. Returns a list of dicts with
     name / id_number / date_of_org, skipping rows with no name or ID."""
     rows = []
-    with open(path, newline="", encoding="utf-8-sig") as f:
-        for row in csv.DictReader(f):
-            name = (row.get("Entityname") or "").strip()
-            id_number = (row.get("ID Number") or "").strip()
-            if not name or not id_number:
-                continue
-            rows.append({
-                "name": name,
-                "id_number": id_number,
-                "date_of_org": (row.get("DateOfOrganization") or "").strip(),
-            })
+    for row in _read_csv_rows(path):
+        name = (row.get("Entityname") or "").strip()
+        id_number = (row.get("ID Number") or "").strip()
+        if not name or not id_number:
+            continue
+        rows.append({
+            "name": name,
+            "id_number": id_number,
+            "date_of_org": (row.get("DateOfOrganization") or "").strip(),
+        })
     return rows
 
 
