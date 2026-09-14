@@ -5,16 +5,23 @@ Division's online filing system) and flag likely address-compliance issues
 under c.156B s.13(c)(2) (name, residence, and post-office address of each
 initial director and the president, treasurer, and clerk).
 
-Requires poppler's `pdftotext` on PATH (macOS: brew install poppler;
-Ubuntu/Debian: apt-get install poppler-utils). Text is extracted with
-`pdftotext -layout`, which preserves column alignment - tried pdfplumber's
-own table detection first, but real filings often render Article VII(b)
-as plain whitespace-aligned text with no ruling lines pdfplumber can
-detect (and separately, pdfplumber's own layout-preserving text mode
-truncated mid-table on at least one real filing where `pdftotext -layout`
-extracted it completely) - so rows are parsed directly off the layout text
-using the title keywords (PRESIDENT/TREASURER/CLERK/DIRECTOR) as row
-boundaries instead of relying on any detected table structure.
+Requires poppler's `pdftotext` on PATH (macOS: brew install poppler, or
+conda install -c conda-forge poppler; Ubuntu/Debian: apt-get install
+poppler-utils). Text is extracted with `pdftotext -layout`, which preserves
+column alignment - tried pdfplumber's own table detection first, but real
+filings often render Article VII(b) as plain whitespace-aligned text with
+no ruling lines pdfplumber can detect (and separately, pdfplumber's own
+layout-preserving text mode truncated mid-table on at least one real filing
+where `pdftotext -layout` extracted it completely) - so rows are parsed
+directly off the layout text using the title keywords
+(PRESIDENT/TREASURER/CLERK/DIRECTOR) as row boundaries instead of relying
+on any detected table structure.
+
+Also requires the Tesseract OCR engine on PATH (macOS: conda install -c
+conda-forge tesseract, or brew install tesseract; Ubuntu/Debian: apt-get
+install tesseract-ocr) and the pytesseract/pdf2image Python packages
+(pip install -r requirements.txt), used for pages that turn out to be
+scanned images rather than e-filed text.
 
 Usage:
     python scraper/parse_articles.py data/pdfs                       # a folder of PDFs
@@ -22,15 +29,19 @@ Usage:
     python scraper/parse_articles.py data/pdfs/001217378.pdf         # or one file
 
 Outputs (in data/output/):
-    parsed_officers.csv   one row per person listed in Article VII(b)
+    parsed_officers.csv   one row per person listed in Article VII(b), with
+                           a `source` column ("text" or "ocr") per row
     parsed_entities.csv   one row per filing, with roll-up counts and flags
-    parse_log.csv         per-file status (ok / no_table / needs_ocr / error) -
-                           this is your manual-review list: filter for status
-                           in (needs_ocr, no_table) to get every entity whose
-                           Article VII needs a human to open the PDF and read
-                           it directly (pass entities.csv as the second
-                           argument so this list includes entity names, not
-                           just the ID-number filename)
+    parse_log.csv         per-file status - this is your manual-review list:
+                           filter for status in (needs_ocr, no_table,
+                           no_table_ocr) to get every entity whose Article
+                           VII needs a human to open the PDF and read it
+                           directly, and status ending in _ocr to find rows
+                           worth spot-checking against the source PDF, since
+                           OCR can misread characters (especially digits in
+                           street numbers/zip codes) (pass entities.csv as
+                           the second argument so this list includes entity
+                           names, not just the ID-number filename)
 
 Interpretation of the form:
     Article VII(b) is a 4-column table: Title | Individual Name |
@@ -47,18 +58,21 @@ Flags are heuristics to prioritise review, not legal conclusions:
     res_eq_po          residential address == the person's post-office address
     res_unit           residential block mentions suite/floor/unit (weak signal)
 
-needs_ocr in parse_log.csv means everything past the state's generic typed
-cover page (page 1, present on every filing) had under 200 characters of
-text - i.e. the actual filed Articles of Organization is a scanned image,
-not an e-filed form with a text layer. This script does not attempt OCR;
-those filings need manual review (open the PDF, read Article VII yourself)
-or a separate OCR pass.
-
-no_table means real text was found past the cover page, but no table
-matching the expected Article VII(b) header ("Title" / "Name" columns) was
-detected - this can mean the filing genuinely left officers/directors
-blank, or that this filing's layout doesn't match what find_officer_rows()
-expects. Worth a quick manual look either way.
+Status values in parse_log.csv:
+    ok            text layer had everything needed, parsed cleanly
+    ok_ocr        text layer was empty/near-empty on some pages (scanned
+                  images), OCR filled them in and parsing succeeded -
+                  worth a spot-check against the source PDF
+    no_table      real text found (no OCR needed), but nothing matched the
+                  expected Article VII(b) row pattern - the filing may have
+                  genuinely left officers/directors blank, or this filing's
+                  layout doesn't match what find_officer_rows() expects
+    no_table_ocr  same as no_table, but only after OCR still didn't produce
+                  a matching row - more likely a genuinely blank section
+    needs_ocr     OCR was attempted and still found under 200 characters on
+                  the non-certificate pages - a genuinely blank/corrupt/
+                  unreadable page, needs manual review
+    error         unexpected exception (see the status text for detail)
 """
 
 import csv
@@ -201,6 +215,26 @@ def find_officer_rows(text):
         yield current["title"], current["name"], "\n".join(current["address_lines"]), current["term"]
 
 
+def ocr_scanned_pages(path, page_texts):
+    """OCR any non-certificate page whose native text is near-empty (a
+    scanned image), leaving pages that already have usable native text
+    alone - a filing can mix a typed cover with a scanned signature page,
+    or vice versa."""
+    from pdf2image import convert_from_path
+    import pytesseract
+
+    targets = [i for i, t in enumerate(page_texts)
+               if not _is_certificate_page(t) and len(t.strip()) < 50]
+    if not targets:
+        return page_texts
+    images = convert_from_path(str(path), dpi=300)
+    result = list(page_texts)
+    for i in targets:
+        if i < len(images):
+            result[i] = pytesseract.image_to_string(images[i])
+    return result
+
+
 def parse_pdf(path):
     # Every filing bookends the actual filed Articles of Organization with a
     # generic typed certificate page from the state ("I hereby certify that,
@@ -212,8 +246,16 @@ def parse_pdf(path):
     page_texts = get_page_texts(path)
     substantive_pages = [t for t in page_texts if not _is_certificate_page(t)]
     substantive_text = "\n".join(substantive_pages) if substantive_pages else "\n".join(page_texts)
+    ocr_used = False
     if len(substantive_text.strip()) < 200:
-        return None, [], "needs_ocr"
+        page_texts = ocr_scanned_pages(path, page_texts)
+        substantive_pages = [t for t in page_texts if not _is_certificate_page(t)]
+        substantive_text = "\n".join(substantive_pages) if substantive_pages else "\n".join(page_texts)
+        ocr_used = True
+        if len(substantive_text.strip()) < 200:
+            # OCR still found nothing usable - genuinely blank/corrupt page,
+            # not just a rendering issue text-layer detection could miss.
+            return None, [], "needs_ocr"
     text = "\n".join(page_texts)
     meta = parse_metadata(text)
     meta["file"] = str(path)
@@ -240,10 +282,12 @@ def parse_pdf(path):
             "res_eq_agent": int(bool(n_res) and bool(n_agent) and n_res == n_agent),
             "res_eq_po": int(bool(n_res) and n_res == norm_addr(po)),
             "res_unit": int(bool(UNIT.search(res))),
+            "source": "ocr" if ocr_used else "text",
         })
+    suffix = "_ocr" if ocr_used else ""
     if not people:
-        return meta, [], "no_table"
-    return meta, people, "ok"
+        return meta, [], "no_table" + suffix
+    return meta, people, "ok" + suffix
 
 
 def roll_up(meta, people):
