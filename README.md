@@ -54,8 +54,9 @@ playwright install chromium
 
 # parse_articles.py shells out to poppler's pdftotext (more reliable than any
 # Python PDF library we tried against these real filings - see its docstring)
-brew install poppler          # macOS
-# apt-get install poppler-utils   # Ubuntu/Debian
+conda install -c conda-forge poppler tesseract   # if using a conda env
+# brew install poppler tesseract                 # macOS without conda
+# apt-get install poppler-utils tesseract-ocr     # Ubuntu/Debian
 ```
 
 The scraper always opens a visible browser window (`headless=False`) so you
@@ -118,16 +119,24 @@ officers) won't split — the full text is preserved, but lands entirely in
 of the above flags.
 
 `data/output/parse_log.csv` — per-PDF status, and your manual-review list:
-filter for `status` in (`needs_ocr`, `no_table`) to get every entity that
-needs a human to open the PDF and read Article VII directly.
-- `needs_ocr`: the filing's actual content (everything past the state's
-  generic cover certificate page, which appears as both the first and last
-  page of every PDF) has under 200 characters of extracted text — i.e. it's
-  a scanned image, not an e-filed form with a text layer. This script does
-  not OCR those.
-- `no_table`: real text was found, but nothing matched the expected
-  Article VII(b) row pattern — could mean the filing genuinely left
-  officers/directors blank, or a layout this script doesn't handle yet.
+filter for `status` in (`needs_ocr`, `no_table`, `no_table_ocr`) to get
+every entity that needs a human to open the PDF and read Article VII
+directly. Filter for status ending in `_ocr` to find rows worth
+spot-checking against the source PDF — OCR can misread characters,
+especially digits in street numbers and zip codes.
+- `ok` / `ok_ocr`: parsed successfully; `_ocr` means some pages were
+  scanned images and needed OCR to read.
+- `needs_ocr`: OCR was attempted (any non-certificate page with under 200
+  characters of native text gets OCR'd) and still found nothing usable —
+  a genuinely blank, corrupted, or unreadable page.
+- `no_table` / `no_table_ocr`: real text was found (natively or via OCR),
+  but nothing matched the expected Article VII(b) row pattern. Can mean
+  the filing genuinely left officers/directors blank, or — as happened on
+  one real filing — it's an older/attorney-drafted template with a
+  differently-labeled table, sometimes even deferring the actual names and
+  addresses to a separate attached "Continuation Sheet." Expect some tail
+  of these regardless of how good the parser gets, across ~5 years of
+  filings from different filers and eras.
 
 ## Privacy note
 
