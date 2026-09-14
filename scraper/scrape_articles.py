@@ -232,25 +232,33 @@ def parse_summary(page):
 
 # ------------------------------------------------- filing list (confirmed) --
 
-def find_articles_pdf(page):
+def find_articles_pdf(page, state_id="", debug_dir=None):
     """
     On CorpSummary.aspx: select Articles of Organization, click View filings,
     then on CorpSearchFormList.aspx find the row and return
     (absolute pdf url, filing number, note).
     """
-    page.select_option("#MainContent_lstFilings", ARTICLES_CODE)
+    # Select by visible label rather than the hardcoded value, since the
+    # internal option value may differ by entity type (nonprofit vs.
+    # business corporation) even though the label text is the same.
+    try:
+        page.select_option("#MainContent_lstFilings", label=re.compile(r"articles of organization", re.I))
+    except Exception:
+        page.select_option("#MainContent_lstFilings", ARTICLES_CODE)
     page.click("#MainContent_btnViewFilings")
     page.wait_for_url(re.compile(r"CorpSearchFormList", re.I), timeout=PAGE_TIMEOUT)
     page.wait_for_selector("#MainContent_grdSearchResults", timeout=PAGE_TIMEOUT)
 
     rows = page.locator("#MainContent_grdSearchResults tr.GridRow")
     candidates = []
+    seen_names = []
     for i in range(rows.count()):
         c = rows.nth(i).locator("td")
         if c.count() < 6:
             continue
         filing_name = c.nth(1).inner_text().strip()
-        if filing_name.lower() != "articles of organization":
+        seen_names.append(filing_name)
+        if "articles of organization" not in filing_name.lower():
             continue
         date_s = c.nth(3).inner_text().strip()
         filing_no = c.nth(4).inner_text().strip()
@@ -265,7 +273,18 @@ def find_articles_pdf(page):
         candidates.append((when, filing_no, urljoin(page.url, href), a.first.inner_text().strip()))
 
     if not candidates:
-        return None, "", "no Articles of Organization row"
+        if debug_dir is not None:
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                page.screenshot(path=str(debug_dir / f"{state_id or 'unknown'}_filinglist.png"), full_page=True)
+                (debug_dir / f"{state_id or 'unknown'}_filinglist.html").write_text(page.content(), encoding="utf-8")
+            except Exception:
+                pass
+        if seen_names:
+            note = f"no Articles of Organization row; filing types seen: {sorted(set(seen_names))}"
+        else:
+            note = "no Articles of Organization row; grid had no rows at all"
+        return None, "", note
     candidates.sort()                       # earliest filing first
     when, filing_no, url, label = candidates[0]
     note = f"{len(candidates)} articles rows; took earliest" if len(candidates) > 1 else label
@@ -345,7 +364,7 @@ def main(csv_path):
                 append_rows(OFFICERS, officers)
 
                 # 3. filing list -> pdf link
-                url, filing_no, note = find_articles_pdf(page)
+                url, filing_no, note = find_articles_pdf(page, state_id, DEBUG_DIR)
                 if url is None:
                     log_result(name, expected_id, state_id, "", "no_articles", note=note)
                     time.sleep(PAUSE_BETWEEN)
