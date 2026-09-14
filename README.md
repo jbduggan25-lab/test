@@ -51,6 +51,11 @@ before trusting it at scale.
 ```bash
 pip install -r requirements.txt
 playwright install chromium
+
+# parse_articles.py shells out to poppler's pdftotext (more reliable than any
+# Python PDF library we tried against these real filings - see its docstring)
+brew install poppler          # macOS
+# apt-get install poppler-utils   # Ubuntu/Debian
 ```
 
 The scraper always opens a visible browser window (`headless=False`) so you
@@ -65,7 +70,8 @@ it under Xvfb: `xvfb-run -a python scraper/scrape_articles.py entities.csv`
 python scraper/scrape_articles.py entities.csv
 
 # 2. Extract officer/director addresses from whatever PDFs were downloaded
-python scraper/parse_articles.py data/pdfs
+#    (pass entities.csv too so the review list has entity names, not just IDs)
+python scraper/parse_articles.py data/pdfs entities.csv
 ```
 
 `entities.csv` is the Secretary's office export as-is (needs at least
@@ -102,13 +108,26 @@ review, not conclusions — e.g. `res_eq_principal` just means the residential
 address matches the principal office address, which is expected and fine for
 a small org run out of someone's home.
 
+The residential/post-office split only works for US-format addresses
+(it looks for a "CITY, ST 12345" line as the boundary between the two).
+A foreign address (seen for real on one filing with Hong Kong/China-based
+officers) won't split — the full text is preserved, but lands entirely in
+`residential_address` with `po_address` left blank.
+
 `data/output/parsed_entities.csv` — one row per filing with roll-up counts
 of the above flags.
 
-`data/output/parse_log.csv` — per-PDF status. `needs_ocr` means the PDF had
-under 200 characters of extracted text (likely a scanned image rather than
-an e-filed form) — this script does not OCR those; they need manual review
-or a separate OCR pass if there turn out to be many of them.
+`data/output/parse_log.csv` — per-PDF status, and your manual-review list:
+filter for `status` in (`needs_ocr`, `no_table`) to get every entity that
+needs a human to open the PDF and read Article VII directly.
+- `needs_ocr`: the filing's actual content (everything past the state's
+  generic cover certificate page, which appears as both the first and last
+  page of every PDF) has under 200 characters of extracted text — i.e. it's
+  a scanned image, not an e-filed form with a text layer. This script does
+  not OCR those.
+- `no_table`: real text was found, but nothing matched the expected
+  Article VII(b) row pattern — could mean the filing genuinely left
+  officers/directors blank, or a layout this script doesn't handle yet.
 
 ## Privacy note
 
