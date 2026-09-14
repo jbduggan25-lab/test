@@ -253,7 +253,12 @@ def find_articles_pdf(page, state_id="", debug_dir=None):
     candidates = []
     seen_names = []
     for i in range(rows.count()):
-        c = rows.nth(i).locator("td")
+        # The site renders the leading checkbox cell as <th scope="row">
+        # instead of <td> when an entity has exactly one filing on record
+        # (e.g. a new entity with only its original Articles of Organization
+        # and no annual reports yet) - match both so column positions stay
+        # correct either way.
+        c = rows.nth(i).locator("td, th")
         if c.count() < 6:
             continue
         filing_name = c.nth(1).inner_text().strip()
