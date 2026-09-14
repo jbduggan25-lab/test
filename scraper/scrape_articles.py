@@ -1,277 +1,402 @@
 """
-Download Articles of Organization PDFs from the Massachusetts Secretary of the
-Commonwealth's Corporations Division database (corp.sec.state.ma.us) for a list
-of entity ID numbers.
-
-IMPORTANT - selectors not yet verified against the live site
---------------------------------------------------------------
-This was written without live access to corp.sec.state.ma.us (network access to
-that domain is blocked in the environment this was authored in). The search-box
-label text, filing-table structure, and PDF-link pattern below are based on the
-general shape of that ASP.NET WebForms site and are the first thing to check if
-a run fails immediately for every entity.
-
-Run a small batch first in headed + debug mode:
-
-    python scraper/scrape_articles.py --input entities.csv --limit 3 --headed
-
-If lookup/search/filing-matching fails, this script writes a screenshot and the
-page HTML to data/debug/<id>_<step>.{png,html} instead of crashing blindly -
-send those files back for a selector fix.
+Bulk-download Articles of Organization from the Massachusetts Corporations Division.
 
 Usage:
-    python scraper/scrape_articles.py --input entities.csv \
-        --output-dir data/pdfs --log data/scrape_log.csv
+    pip install playwright
+    playwright install chromium
+    python scraper/scrape_articles.py entities.csv
 
-Input CSV must have at least these columns (matching the Secretary's export):
-    ID Number, Entityname, DateOfOrganization
+entities.csv: the Secretary's office export, with at least the columns
+"ID Number", "Entityname", "DateOfOrganization".
 
-Resumable: rows already marked "ok" in the log are skipped on re-run unless
---force is passed.
+Outputs (all written incrementally, safe to stop and restart):
+    data/pdfs/<state_id>.pdf   the Articles of Organization for each entity found
+    data/output/results.csv    search_name, expected_id, state_id, filing_no,
+                                status, pdf_path, note
+    data/output/entities.csv   summary-page fields: ID, type, org date, principal
+                                office, resident agent
+    data/output/officers.csv   the summary page's Officers & Directors grid
+                                (title, name, address, term) - one row per person
+
+Status values in results.csv:
+    ok            PDF saved
+    unresolved    name search returned zero or several candidates; do by hand
+    id_mismatch   name search landed on an entity whose displayed ID doesn't
+                  match the expected ID Number from entities.csv - likely a
+                  duplicate/reused name; PDF is NOT downloaded, needs a human
+    no_articles   entity found but no Articles of Organization row listed
+    no_pdf        row found but the PDF request didn't return a PDF
+    error         unexpected exception (see note / debug screenshot)
+
+What has been confirmed from page source vs. what is still inferred:
+    CONFIRMED  CorpSummary.aspx  - all element IDs used in parse_summary(),
+               the filing select (#MainContent_lstFilings, value 0300013 =
+               Articles of Organization) and #MainContent_btnViewFilings
+    CONFIRMED  CorpSearchFormList.aspx - #MainContent_grdSearchResults rows,
+               column order, and the CorpSearchRedirector.aspx?Action=PDF link
+    INFERRED   CorpSearch.aspx - the entity-name text box and the layout of the
+               results grid. Marked ### VERIFY ### below. The script pauses
+               with the browser open if these fail so you can click through.
+
+Etiquette / robots.txt: the site's robots rules disallow automated access to
+the summary/list pages this script depends on. This runs one entity at a time
+with a delay to stay as light as possible, but that does not make it
+robots-compliant - read the Division's terms and consider asking them for a
+bulk data extract before running this across a full multi-year list. Keep
+batches small.
+
+Launches a visible (non-headless) browser window. On a server with no
+display, run under Xvfb: `xvfb-run -a python scraper/scrape_articles.py entities.csv`
 """
-import argparse
+
 import csv
-import random
 import re
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urljoin
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 SEARCH_URL = "https://corp.sec.state.ma.us/corpweb/CorpSearch/CorpSearch.aspx"
+ARTICLES_CODE = "0300013"     # value of "Articles of Organization" in the filings select
+PDF_DIR = Path("data/pdfs")
+RESULTS = Path("data/output/results.csv")
+ENTITIES = Path("data/output/entities.csv")
+OFFICERS = Path("data/output/officers.csv")
+DEBUG_DIR = Path("data/debug")
+PAUSE_BETWEEN = 2.5           # seconds between entities
+PAGE_TIMEOUT = 45_000         # ms
 
-LOG_FIELDS = ["id_number", "entity_name", "status", "pdf_path", "filing_date_matched", "note"]
+
+# ----------------------------------------------------------------- helpers --
+
+def load_input(path):
+    """Read the Secretary's office export CSV. Returns a list of dicts with
+    name / id_number / date_of_org, skipping rows with no name or ID."""
+    rows = []
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        for row in csv.DictReader(f):
+            name = (row.get("Entityname") or "").strip()
+            id_number = (row.get("ID Number") or "").strip()
+            if not name or not id_number:
+                continue
+            rows.append({
+                "name": name,
+                "id_number": id_number,
+                "date_of_org": (row.get("DateOfOrganization") or "").strip(),
+            })
+    return rows
 
 
-def parse_date_of_organization(raw: str):
-    raw = (raw or "").strip()
-    for fmt in ("%m-%d-%Y", "%m/%d/%Y", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(raw, fmt).date()
-        except ValueError:
+def already_done():
+    if not RESULTS.exists():
+        return set()
+    with open(RESULTS, newline="", encoding="utf-8") as f:
+        return {r["expected_id"] for r in csv.DictReader(f) if r.get("status") == "ok"}
+
+
+def append_rows(path, rows):
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    new = not path.exists()
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        if new:
+            w.writeheader()
+        w.writerows(rows)
+
+
+def log_result(search_name, expected_id, state_id, filing_no, status, pdf_path="", note=""):
+    append_rows(RESULTS, [{
+        "search_name": search_name, "expected_id": expected_id, "state_id": state_id,
+        "filing_no": filing_no, "status": status, "pdf_path": pdf_path, "note": note,
+    }])
+    print(f"[{status}] {search_name}" + (f": {note}" if note else ""))
+
+
+def norm(s):
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def txt(page, selector):
+    loc = page.locator(selector)
+    return loc.first.inner_text().strip() if loc.count() else ""
+
+
+# ------------------------------------------------------- search (inferred) --
+
+SEARCH_MODES = {"Exact match": "M", "Begins with": "B", "Full text": "F", "Soundex": "S"}
+
+
+def run_search(page, name, mode):
+    """
+    mode: 'Exact match' or 'Begins with'.
+    Confirmed from page source: #MainContent_txtEntityName (text box),
+    #MainContent_ddBeginsWithEntityName (select: B/M/F/S),
+    #MainContent_ddRecordsPerPage (25/50/100), #MainContent_btnSearch
+    ("Search Corporations"). Results arrive via an AJAX UpdatePanel into
+    #MainContent_SearchControl_tblGrid1, so there is no page navigation to
+    wait for; we wait for that container to fill instead.
+    """
+    page.goto(SEARCH_URL, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
+    page.wait_for_selector("#MainContent_txtEntityName", timeout=PAGE_TIMEOUT)
+    page.check("#MainContent_rdoByEntityName")
+    page.fill("#MainContent_txtEntityName", name)
+    page.select_option("#MainContent_ddBeginsWithEntityName", SEARCH_MODES[mode])
+    page.select_option("#MainContent_ddRecordsPerPage", "100")
+    page.click("#MainContent_btnSearch")
+    try:
+        page.wait_for_function(
+            """() => {
+                const g = document.querySelector('#MainContent_SearchControl_tblGrid1');
+                if (g && g.innerText.trim().length > 0) return true;
+                if (document.querySelector('table.Grid')) return true;
+                const m = document.querySelector('#MainContent_lblMessage');
+                return !!(m && m.innerText.trim().length > 0);
+            }""",
+            timeout=PAGE_TIMEOUT,
+        )
+    except PWTimeout:
+        pass                      # fall through; pick_result will report "no results"
+    page.wait_for_timeout(500)
+
+
+def pick_result(page, name):
+    """Return (link locator, note) for the single matching entity, or (None, note)."""
+    ### VERIFY ###  results grid layout; assumes one <tr> per entity with the
+    # name as a link and the entity type somewhere in the row text.
+    rows = page.locator("table.Grid tr.GridRow")
+    if rows.count() == 0:
+        rows = page.locator("table tr").filter(has=page.locator("a"))
+    n = rows.count()
+    if n == 0:
+        return None, "no results"
+    target = norm(name)
+    exact, nonprofit_exact = [], []
+    for i in range(n):
+        row = rows.nth(i)
+        link = row.locator("a").first
+        if link.count() == 0:
             continue
+        if norm(link.inner_text()) == target:
+            exact.append(link)
+            if "nonprofit" in row.inner_text().lower():
+                nonprofit_exact.append(link)
+    if len(nonprofit_exact) == 1:
+        return nonprofit_exact[0], ""
+    if len(exact) == 1:
+        return exact[0], ""
+    if len(exact) > 1:
+        return None, f"{len(exact)} exact-name matches"
+    if n == 1:
+        return rows.nth(0).locator("a").first, "single non-exact result"
+    return None, f"{n} results, none exact"
+
+
+# ------------------------------------------------- summary page (confirmed) --
+
+def parse_summary(page):
+    d = {
+        "state_id": txt(page, "#MainContent_lblIDNumberHeader"),
+        "entity_name": txt(page, "#MainContent_lblEntityName"),
+        "entity_type": txt(page, "#MainContent_lblEntityType"),
+        "org_date": txt(page, "#MainContent_lblOrganisationDate"),
+        "principal_street": txt(page, "#MainContent_lblPrincipleStreet"),
+        "principal_city": txt(page, "#MainContent_lblPrincipleCity").rstrip(", "),
+        "principal_state": txt(page, "#MainContent_lblPrincipleState"),
+        "principal_zip": txt(page, "#MainContent_lblPrincipleZip"),
+        "agent_name": txt(page, "#MainContent_lblResidentAgentName"),
+        "agent_street": txt(page, "#MainContent_lblResidentStreet"),
+        "agent_city": txt(page, "#MainContent_lblResidentCity").rstrip(", "),
+        "agent_state": txt(page, "#MainContent_lblResidentState"),
+        "agent_zip": txt(page, "#MainContent_lblResidentZip"),
+        "summary_url": page.url,
+    }
+    officers = []
+    rows = page.locator("#MainContent_grdOfficers tr.GridRow")
+    for i in range(rows.count()):
+        c = rows.nth(i).locator("td")
+        if c.count() >= 4:
+            officers.append({
+                "state_id": d["state_id"],
+                "title": c.nth(0).inner_text().strip(),
+                "name": re.sub(r"\s+", " ", c.nth(1).inner_text()).strip(),
+                "address": re.sub(r"\s+", " ", c.nth(2).inner_text()).strip(),
+                "term_expires": c.nth(3).inner_text().strip(),
+            })
+    return d, officers
+
+
+# ------------------------------------------------- filing list (confirmed) --
+
+def find_articles_pdf(page):
+    """
+    On CorpSummary.aspx: select Articles of Organization, click View filings,
+    then on CorpSearchFormList.aspx find the row and return
+    (absolute pdf url, filing number, note).
+    """
+    page.select_option("#MainContent_lstFilings", ARTICLES_CODE)
+    page.click("#MainContent_btnViewFilings")
+    page.wait_for_url(re.compile(r"CorpSearchFormList", re.I), timeout=PAGE_TIMEOUT)
+    page.wait_for_selector("#MainContent_grdSearchResults", timeout=PAGE_TIMEOUT)
+
+    rows = page.locator("#MainContent_grdSearchResults tr.GridRow")
+    candidates = []
+    for i in range(rows.count()):
+        c = rows.nth(i).locator("td")
+        if c.count() < 6:
+            continue
+        filing_name = c.nth(1).inner_text().strip()
+        if filing_name.lower() != "articles of organization":
+            continue
+        date_s = c.nth(3).inner_text().strip()
+        filing_no = c.nth(4).inner_text().strip()
+        a = c.nth(5).locator("a")
+        if a.count() == 0:
+            continue
+        href = a.first.get_attribute("href") or ""
+        try:
+            when = datetime.strptime(date_s, "%m/%d/%Y %I:%M %p")
+        except ValueError:
+            when = datetime.max
+        candidates.append((when, filing_no, urljoin(page.url, href), a.first.inner_text().strip()))
+
+    if not candidates:
+        return None, "", "no Articles of Organization row"
+    candidates.sort()                       # earliest filing first
+    when, filing_no, url, label = candidates[0]
+    note = f"{len(candidates)} articles rows; took earliest" if len(candidates) > 1 else label
+    return url, filing_no, note
+
+
+def fetch_pdf(context, url, _depth=0):
+    """
+    GET the redirector link with the browser's cookies (redirects are followed,
+    landing on CorpSearchViewPDF.aspx). Return PDF bytes or None.
+    If the viewer returns HTML that embeds the PDF, follow the embed once.
+    """
+    resp = context.request.get(url, timeout=PAGE_TIMEOUT)
+    body = resp.body()
+    if resp.ok and body[:5] == b"%PDF-":
+        return body
+    if _depth == 0 and resp.ok and b"<" in body[:200]:
+        html = body.decode("utf-8", "ignore")
+        m = re.search(r"<(?:iframe|embed|object)[^>]+(?:src|data)=[\"']?([^\"' >]+)", html, re.I)
+        if m:
+            return fetch_pdf(context, urljoin(resp.url, m.group(1)), _depth=1)
     return None
 
 
-def load_log(log_path: Path):
-    done = {}
-    if log_path.exists():
-        with log_path.open(newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                done[row["id_number"]] = row
-    return done
+# --------------------------------------------------------------------- main --
 
-
-def append_log(log_path: Path, row: dict):
-    new_file = not log_path.exists()
-    with log_path.open("a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=LOG_FIELDS)
-        if new_file:
-            w.writeheader()
-        w.writerow(row)
-
-
-def dump_debug(page, id_number: str, step: str, debug_dir: Path):
-    debug_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        page.screenshot(path=str(debug_dir / f"{id_number}_{step}.png"), full_page=True)
-    except Exception:
-        pass
-    try:
-        (debug_dir / f"{id_number}_{step}.html").write_text(page.content(), encoding="utf-8")
-    except Exception:
-        pass
-
-
-def search_by_id(page, id_number: str, debug_dir: Path) -> bool:
-    """Navigate the search form for a given entity ID. Returns True if a
-    single entity summary page was reached."""
-    page.goto(SEARCH_URL, wait_until="domcontentloaded")
-
-    # Try the common label variants for the ID-number search field.
-    candidates = [
-        re.compile(r"Data\s*Number", re.I),
-        re.compile(r"Entity\s*ID", re.I),
-        re.compile(r"ID\s*Number", re.I),
-    ]
-    field = None
-    for pattern in candidates:
-        try:
-            loc = page.get_by_label(pattern)
-            if loc.count() > 0:
-                field = loc.first
-                break
-        except Exception:
-            continue
-
-    if field is None:
-        dump_debug(page, id_number, "no_id_field", debug_dir)
-        return False
-
-    field.fill(id_number)
-    field.press("Enter")
-
-    try:
-        page.wait_for_load_state("networkidle", timeout=15000)
-    except PWTimeout:
-        pass
-
-    # If a results LIST page loaded instead of a single summary page (e.g. the
-    # ID matched more than one record, which shouldn't happen for an exact
-    # Data Number match but is handled defensively), click the first result row.
-    try:
-        row_link = page.get_by_role("link", name=re.compile(id_number))
-        if row_link.count() > 0:
-            row_link.first.click()
-            page.wait_for_load_state("networkidle", timeout=15000)
-    except PWTimeout:
-        pass
-
-    return True
-
-
-def find_articles_pdf_url(page, date_of_org, id_number: str, debug_dir: Path):
-    """On an entity summary/filing-history page, locate the Articles of
-    Organization filing and return its PDF link href (or None)."""
-    try:
-        page.get_by_text(re.compile(r"Filing", re.I)).first.wait_for(timeout=10000)
-    except PWTimeout:
-        dump_debug(page, id_number, "no_filings_section", debug_dir)
-        return None
-
-    rows = page.locator("tr").all()
-    best_href = None
-    best_row_text = None
-    for row in rows:
-        text = row.inner_text().strip()
-        if not text or "articles of organization" not in text.lower():
-            continue
-        link = row.locator("a")
-        if link.count() == 0:
-            continue
-        href = link.first.get_attribute("href")
-        if not href:
-            continue
-        if date_of_org and date_of_org.strftime("%m/%d/%Y") in text:
-            return href  # exact date match, take it immediately
-        if best_href is None:
-            best_href = href
-            best_row_text = text
-
-    if best_href is None:
-        dump_debug(page, id_number, "no_articles_row", debug_dir)
-    return best_href
-
-
-def download_pdf(page, href: str, dest: Path) -> bool:
-    url = href
-    if href.startswith("javascript:") or href.startswith("#"):
-        # Postback link - click it and capture the resulting download / new tab.
-        try:
-            with page.expect_download(timeout=20000) as dl_info:
-                page.locator(f'a[href="{href}"]').first.click()
-            dl_info.value.save_as(str(dest))
-            return True
-        except PWTimeout:
-            try:
-                with page.context.expect_page(timeout=10000) as new_page_info:
-                    page.locator(f'a[href="{href}"]').first.click()
-                new_page = new_page_info.value
-                new_page.wait_for_load_state()
-                resp = page.context.request.get(new_page.url)
-                dest.write_bytes(resp.body())
-                new_page.close()
-                return True
-            except Exception:
-                return False
-    else:
-        full_url = page.url.rsplit("/", 1)[0] + "/" + url if not url.startswith("http") else url
-        resp = page.context.request.get(full_url)
-        if resp.ok:
-            dest.write_bytes(resp.body())
-            return True
-        return False
-
-
-def process_one(page, id_number, entity_name, date_raw, output_dir: Path, debug_dir: Path):
-    date_of_org = parse_date_of_organization(date_raw)
-
-    if not search_by_id(page, id_number, debug_dir):
-        return dict(id_number=id_number, entity_name=entity_name, status="fail_search",
-                    pdf_path="", filing_date_matched="", note="ID search field not found - see debug dump")
-
-    href = find_articles_pdf_url(page, date_of_org, id_number, debug_dir)
-    if not href:
-        return dict(id_number=id_number, entity_name=entity_name, status="fail_no_filing",
-                    pdf_path="", filing_date_matched="", note="Articles of Organization row not found")
-
-    dest = output_dir / f"{id_number}.pdf"
-    ok = download_pdf(page, href, dest)
-    if not ok:
-        return dict(id_number=id_number, entity_name=entity_name, status="fail_download",
-                    pdf_path="", filing_date_matched="", note=f"could not fetch {href}")
-
-    return dict(id_number=id_number, entity_name=entity_name, status="ok",
-                 pdf_path=str(dest), filing_date_matched=str(date_of_org or ""), note="")
-
-
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--input", required=True, help="CSV from the Secretary's office export")
-    ap.add_argument("--output-dir", default="data/pdfs")
-    ap.add_argument("--debug-dir", default="data/debug")
-    ap.add_argument("--log", default="data/scrape_log.csv")
-    ap.add_argument("--limit", type=int, default=None, help="only process the first N rows (for testing)")
-    ap.add_argument("--start-index", type=int, default=0)
-    ap.add_argument("--headed", action="store_true", help="show the browser window")
-    ap.add_argument("--delay", type=float, default=3.0, help="base seconds between requests")
-    ap.add_argument("--jitter", type=float, default=2.0, help="max extra random seconds added to delay")
-    ap.add_argument("--force", action="store_true", help="re-process rows already logged as ok")
-    args = ap.parse_args()
-
-    output_dir = Path(args.output_dir)
-    debug_dir = Path(args.debug_dir)
-    log_path = Path(args.log)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    import pandas as pd
-    df = pd.read_csv(args.input, dtype=str).fillna("")
-    df = df.iloc[args.start_index:]
-    if args.limit:
-        df = df.iloc[: args.limit]
-
-    done = load_log(log_path)
+def main(csv_path):
+    entries = load_input(csv_path)
+    done = already_done()
+    todo = [e for e in entries if e["id_number"] not in done]
+    print(f"{len(entries)} entities, {len(done)} already done, {len(todo)} to go")
+    PDF_DIR.mkdir(parents=True, exist_ok=True)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=not args.headed)
-        page = browser.new_page()
+        browser = p.chromium.launch(headless=False)
+        context = browser.new_context(accept_downloads=True)
+        page = context.new_page()
 
-        for _, row in df.iterrows():
-            id_number = str(row.get("ID Number", "")).strip()
-            entity_name = row.get("Entityname", "")
-            date_raw = row.get("DateOfOrganization", "")
-
-            if not id_number:
-                continue
-            if not args.force and done.get(id_number, {}).get("status") == "ok":
-                print(f"skip (already ok): {id_number} {entity_name}")
-                continue
-
-            print(f"processing: {id_number} {entity_name}")
+        for entry in todo:
+            name, expected_id = entry["name"], entry["id_number"]
+            state_id, filing_no = "", ""
             try:
-                result = process_one(page, id_number, entity_name, date_raw, output_dir, debug_dir)
-            except Exception as e:
-                result = dict(id_number=id_number, entity_name=entity_name, status="fail_exception",
-                               pdf_path="", filing_date_matched="", note=str(e))
-                dump_debug(page, id_number, "exception", debug_dir)
+                # 1. search
+                run_search(page, name, "Exact match")
+                link, note = pick_result(page, name)
+                if link is None and note == "no results":
+                    run_search(page, name, "Begins with")
+                    link, note = pick_result(page, name)
+                if link is None:
+                    log_result(name, expected_id, "", "", "unresolved", note=note)
+                    time.sleep(PAUSE_BETWEEN)
+                    continue
 
-            print(f"  -> {result['status']} {result['note']}")
-            append_log(log_path, result)
-            time.sleep(args.delay + random.random() * args.jitter)
+                # 2. summary page
+                link.click()
+                page.wait_for_url(re.compile(r"CorpSummary", re.I), timeout=PAGE_TIMEOUT)
+                page.wait_for_selector("#MainContent_lblIDNumberHeader", timeout=PAGE_TIMEOUT)
+                summary, officers = parse_summary(page)
+                state_id = summary["state_id"]
+                if not state_id:
+                    print(f"Couldn't read ID for {name}; pausing so you can look. Press Resume when on the summary page.")
+                    page.pause()
+                    summary, officers = parse_summary(page)
+                    state_id = summary["state_id"] or norm(name)[:40]
+
+                # Cross-check against the ID number already known from the
+                # Secretary's export - catches a name-search false match
+                # (e.g. a dissolved entity whose name was later reused).
+                if norm(state_id).lstrip("0") != norm(expected_id).lstrip("0"):
+                    log_result(name, expected_id, state_id, "", "id_mismatch",
+                               note=f"searched for {name}, landed on ID {state_id}, expected {expected_id}")
+                    time.sleep(PAUSE_BETWEEN)
+                    continue
+
+                summary["search_name"] = name
+                append_rows(ENTITIES, [summary])
+                append_rows(OFFICERS, officers)
+
+                # 3. filing list -> pdf link
+                url, filing_no, note = find_articles_pdf(page)
+                if url is None:
+                    log_result(name, expected_id, state_id, "", "no_articles", note=note)
+                    time.sleep(PAUSE_BETWEEN)
+                    continue
+
+                # 4. download
+                pdf = fetch_pdf(context, url)
+                if pdf is None:
+                    # Fallback: click the link and catch the PDF response.
+                    caught = {}
+                    def on_resp(r):
+                        if "application/pdf" in r.headers.get("content-type", ""):
+                            try:
+                                caught["pdf"] = r.body()
+                            except Exception:
+                                pass
+                    context.on("response", on_resp)
+                    with context.expect_page(timeout=10_000) as pop:
+                        page.locator(f"a[href*='{filing_no}']").first.click()
+                    tab = pop.value
+                    deadline = time.time() + 20
+                    while "pdf" not in caught and time.time() < deadline:
+                        time.sleep(0.5)
+                    context.remove_listener("response", on_resp)
+                    tab.close()
+                    pdf = caught.get("pdf")
+                if pdf is None:
+                    log_result(name, expected_id, state_id, filing_no, "no_pdf", note=url)
+                    time.sleep(PAUSE_BETWEEN)
+                    continue
+
+                out = PDF_DIR / f"{state_id}.pdf"
+                out.write_bytes(pdf)
+                log_result(name, expected_id, state_id, filing_no, "ok", str(out), note)
+
+            except Exception as e:
+                DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+                shot = DEBUG_DIR / (re.sub(r"[^A-Za-z0-9]+", "_", name)[:60] + ".png")
+                try:
+                    page.screenshot(path=str(shot), full_page=True)
+                except Exception:
+                    pass
+                log_result(name, expected_id, state_id, filing_no, "error",
+                           note=f"{type(e).__name__}: {str(e).splitlines()[0][:150]} (see {shot})")
+            time.sleep(PAUSE_BETWEEN)
 
         browser.close()
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) != 2:
+        print(__doc__)
+        sys.exit(1)
+    main(sys.argv[1])
