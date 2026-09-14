@@ -5,8 +5,18 @@ Division's online filing system) and flag likely address-compliance issues
 under c.156B s.13(c)(2) (name, residence, and post-office address of each
 initial director and the president, treasurer, and clerk).
 
+Requires poppler's `pdftotext` on PATH (macOS: brew install poppler;
+Ubuntu/Debian: apt-get install poppler-utils). Text is extracted with
+`pdftotext -layout`, which preserves column alignment - tried pdfplumber's
+own table detection first, but real filings often render Article VII(b)
+as plain whitespace-aligned text with no ruling lines pdfplumber can
+detect (and separately, pdfplumber's own layout-preserving text mode
+truncated mid-table on at least one real filing where `pdftotext -layout`
+extracted it completely) - so rows are parsed directly off the layout text
+using the title keywords (PRESIDENT/TREASURER/CLERK/DIRECTOR) as row
+boundaries instead of relying on any detected table structure.
+
 Usage:
-    pip install pdfplumber
     python scraper/parse_articles.py data/pdfs                       # a folder of PDFs
     python scraper/parse_articles.py data/pdfs entities.csv          # + entity names for the review list
     python scraper/parse_articles.py data/pdfs/001217378.pdf         # or one file
@@ -53,14 +63,14 @@ expects. Worth a quick manual look either way.
 
 import csv
 import re
+import subprocess
 import sys
 from pathlib import Path
-
-import pdfplumber
 
 OUTPUT_DIR = Path("data/output")
 
 REQUIRED_TITLES = {"PRESIDENT", "TREASURER", "CLERK", "DIRECTOR"}
+TITLE_LINE = re.compile(r"^\s*(" + "|".join(REQUIRED_TITLES) + r")\b(.*)$")
 CITY_LINE = re.compile(r"^(?P<city>.+?),\s*(?P<state>[A-Z]{2})\s+(?P<zip>\d{5}(?:-\d{4})?)\b(?P<rest>.*)$")
 POBOX = re.compile(r"\b(P\.?\s*O\.?\s*BOX|POST\s+OFFICE\s+BOX|PMB)\b", re.I)
 CARE_OF = re.compile(r"\bC/O\b|\bCARE\s+OF\b", re.I)
@@ -71,6 +81,16 @@ CERTIFICATE_MARKERS = ("hereby certify", "upon examination")
 def _is_certificate_page(text):
     t = text.lower()
     return all(marker in t for marker in CERTIFICATE_MARKERS)
+
+
+def get_page_texts(path):
+    """Layout-preserved per-page text via poppler's pdftotext (pages split on
+    the form-feed characters pdftotext inserts by default)."""
+    result = subprocess.run(
+        ["pdftotext", "-layout", str(path), "-"],
+        capture_output=True, text=True, check=True,
+    )
+    return result.stdout.split("\f")
 
 
 # ------------------------------------------------------------ normalisation --
@@ -144,81 +164,86 @@ def _addr_from_fields(blk):
     return f"{st} {city}, {state} {zp}".strip(" ,")
 
 
-def find_officer_rows(pdf):
-    """Yield (title, name, address_cell, term) from the Article VII(b) table(s)."""
-    in_table = False
-    for page in pdf.pages:
-        for table in page.extract_tables():
-            if not table:
-                continue
-            first = [(c or "").strip() for c in table[0]]
-            is_header = (len(first) >= 3 and first[0].upper().startswith("TITLE")
-                         and "NAME" in first[1].upper())
-            rows = table[1:] if is_header else table
-            if is_header:
-                in_table = True
-            elif not in_table:
-                continue
-            for r in rows:
-                cells = [(c or "").strip() for c in r]
-                if len(cells) < 3:
-                    continue
-                title = cells[0].upper().replace("\n", " ").strip()
-                if not title or title.startswith("TITLE"):
-                    continue
-                if title not in REQUIRED_TITLES and not re.fullmatch(r"[A-Z .\-/]+", title):
-                    # not a title cell -> we've left the officer table
-                    in_table = False
-                    break
-                name = re.sub(r"\s+", " ", cells[1])
-                term = cells[3] if len(cells) > 3 else ""
-                yield title, name, cells[2], term
+def find_officer_rows(text):
+    """Yield (title, name, address_cell, term) from the Article VII(b) block.
+
+    Real filings often render this section as plain whitespace-aligned text
+    with no ruling lines, so this parses rows directly off layout-preserved
+    text rather than relying on detected table structure: each line starting
+    with one of the required titles begins a new person, and subsequent
+    lines (until the next title line) are additional address lines for that
+    person - which split_address_cell() then splits into residential vs.
+    post-office address the same way it would a table cell's text.
+    """
+    sec = re.search(r"corporation is as follows:(.*?)c\.\s*The fiscal year",
+                     text, re.S | re.I)
+    if not sec:
+        return
+    current = None
+    for line in sec.group(1).split("\n"):
+        if not line.strip():
+            continue
+        m = TITLE_LINE.match(line)
+        if m:
+            if current:
+                yield current["title"], current["name"], "\n".join(current["address_lines"]), current["term"]
+            title = m.group(1).upper()
+            cols = [c for c in re.split(r"\s{2,}", m.group(2).strip()) if c]
+            name = re.sub(r"\s+", " ", cols[0]) if cols else ""
+            current = {
+                "title": title, "name": name,
+                "address_lines": [cols[1]] if len(cols) > 1 else [],
+                "term": cols[2] if len(cols) > 2 else "",
+            }
+        elif current:
+            current["address_lines"].append(line.strip())
+    if current:
+        yield current["title"], current["name"], "\n".join(current["address_lines"]), current["term"]
 
 
 def parse_pdf(path):
-    with pdfplumber.open(path) as pdf:
-        # Every filing bookends the actual filed Articles of Organization with
-        # a generic typed certificate page from the state ("I hereby certify
-        # that, upon examination...") - and this shows up as BOTH the first
-        # and last page, not just the first. When the real content (page 2+)
-        # is a scanned image with no text layer, the two certificate copies
-        # alone can still clear a whole-document length check, so judge
-        # needs_ocr on the non-certificate pages only.
-        page_texts = [(p.extract_text() or "") for p in pdf.pages]
-        substantive_pages = [t for t in page_texts if not _is_certificate_page(t)]
-        substantive_text = "\n".join(substantive_pages) if substantive_pages else "\n".join(page_texts)
-        if len(substantive_text.strip()) < 200:
-            return None, [], "needs_ocr"
-        text = "\n".join(page_texts)
-        meta = parse_metadata(text)
-        meta["file"] = str(path)
-        people = []
-        n_principal = norm_addr(meta["principal_office"])
-        n_agent = norm_addr(meta["agent_address"])
-        for title, name, cell, term in find_officer_rows(pdf):
-            res, po, extra = split_address_cell(cell)
-            n_res = norm_addr(res)
-            people.append({
-                "state_id": meta["state_id"],
-                "filing_no": meta["filing_no"],
-                "entity_name": meta["entity_name"],
-                "title": title,
-                "name": name,
-                "residential_address": res,
-                "po_address": po,
-                "extra_address_lines": extra,
-                "term_expires": term,
-                "res_missing": int(not res),
-                "res_pobox": int(bool(POBOX.search(res))),
-                "res_co": int(bool(CARE_OF.search(res))),
-                "res_eq_principal": int(bool(n_res) and n_res == n_principal),
-                "res_eq_agent": int(bool(n_res) and bool(n_agent) and n_res == n_agent),
-                "res_eq_po": int(bool(n_res) and n_res == norm_addr(po)),
-                "res_unit": int(bool(UNIT.search(res))),
-            })
-        if not people:
-            return meta, [], "no_table"
-        return meta, people, "ok"
+    # Every filing bookends the actual filed Articles of Organization with a
+    # generic typed certificate page from the state ("I hereby certify that,
+    # upon examination...") - and this shows up as BOTH the first and last
+    # page, not just the first. When the real content (page 2+) is a scanned
+    # image with no text layer, the two certificate copies alone can still
+    # clear a whole-document length check, so judge needs_ocr on the
+    # non-certificate pages only.
+    page_texts = get_page_texts(path)
+    substantive_pages = [t for t in page_texts if not _is_certificate_page(t)]
+    substantive_text = "\n".join(substantive_pages) if substantive_pages else "\n".join(page_texts)
+    if len(substantive_text.strip()) < 200:
+        return None, [], "needs_ocr"
+    text = "\n".join(page_texts)
+    meta = parse_metadata(text)
+    meta["file"] = str(path)
+    people = []
+    n_principal = norm_addr(meta["principal_office"])
+    n_agent = norm_addr(meta["agent_address"])
+    for title, name, cell, term in find_officer_rows(text):
+        res, po, extra = split_address_cell(cell)
+        n_res = norm_addr(res)
+        people.append({
+            "state_id": meta["state_id"],
+            "filing_no": meta["filing_no"],
+            "entity_name": meta["entity_name"],
+            "title": title,
+            "name": name,
+            "residential_address": res,
+            "po_address": po,
+            "extra_address_lines": extra,
+            "term_expires": term,
+            "res_missing": int(not res),
+            "res_pobox": int(bool(POBOX.search(res))),
+            "res_co": int(bool(CARE_OF.search(res))),
+            "res_eq_principal": int(bool(n_res) and n_res == n_principal),
+            "res_eq_agent": int(bool(n_res) and bool(n_agent) and n_res == n_agent),
+            "res_eq_po": int(bool(n_res) and n_res == norm_addr(po)),
+            "res_unit": int(bool(UNIT.search(res))),
+        })
+    if not people:
+        return meta, [], "no_table"
+    return meta, people, "ok"
 
 
 def roll_up(meta, people):
